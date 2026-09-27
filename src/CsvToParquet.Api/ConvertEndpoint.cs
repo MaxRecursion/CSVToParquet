@@ -8,6 +8,9 @@ namespace CsvToParquet.Api;
 
 public static class ConvertEndpoint
 {
+    /// <summary>Rate-limiter policy that caps how many requests convert at once (<see cref="ConversionOptions.MaxConcurrentRequests"/>).</summary>
+    public const string RateLimiterPolicy = "convert";
+
     private const string ParquetContentType = "application/vnd.apache.parquet";
 
     public static IEndpointRouteBuilder MapConvertEndpoint(this IEndpointRouteBuilder app)
@@ -18,6 +21,9 @@ public static class ConvertEndpoint
             .WithDescription("""
                 The request body is the raw CSV file with `Content-Type: text/csv`, not multipart/form-data.
                 The response body is the Parquet file (zstd-compressed, column types detected automatically).
+
+                Requests are served in parallel. `Conversion:MaxConcurrentRequests` caps how many are admitted at
+                once and `Conversion:MaxConcurrentConversions` caps how many convert at once; the rest queue.
 
                 Large files: upload with a streaming client, for example curl `-T`:
 
@@ -33,7 +39,9 @@ public static class ConvertEndpoint
             .ProducesProblem(StatusCodes.Status413PayloadTooLarge)
             .ProducesProblem(StatusCodes.Status422UnprocessableEntity)
             .ProducesProblem(StatusCodes.Status500InternalServerError)
-            .ProducesProblem(StatusCodes.Status507InsufficientStorage);
+            .ProducesProblem(StatusCodes.Status503ServiceUnavailable)
+            .ProducesProblem(StatusCodes.Status507InsufficientStorage)
+            .RequireRateLimiting(RateLimiterPolicy);
         return app;
     }
 
@@ -69,13 +77,15 @@ public static class ConvertEndpoint
         var parquetPath = Path.Combine(workDirectory, $"{id}.parquet");
         try
         {
-            // 3. Stream the upload to disk; it is never held in memory.
-            var stopwatch = Stopwatch.StartNew();
+            // 3. Stream the upload to disk; it is never held in memory. Uploads are not capped by the conversion
+            // limit, so a queued request keeps using the network while the ones ahead of it convert.
+            var uploadStart = Stopwatch.GetTimestamp();
             var fso = new FileStreamOptions
             {
                 Mode = FileMode.CreateNew,
                 Access = FileAccess.Write,
                 Options = FileOptions.Asynchronous,
+                BufferSize = 0, // CopyToAsync already writes 1 MB at a time; FileStream must not copy it again
                 PreallocationSize = contentLength ?? 0 // reserves disk space up front
             };
             long csvBytes;
@@ -85,7 +95,7 @@ public static class ConvertEndpoint
                 await body.CopyToAsync(csv, 1024 * 1024, http.RequestAborted);
                 csvBytes = csv.Length;
             } // must be closed before DuckDB opens it (Windows file locking)
-            var uploadMs = stopwatch.ElapsedMilliseconds;
+            var uploadMs = (long)Stopwatch.GetElapsedTime(uploadStart).TotalMilliseconds;
 
             // 4. Nothing to convert.
             if (csvBytes == 0)
@@ -97,10 +107,10 @@ public static class ConvertEndpoint
             }
 
             // 5. Convert; DuckDB errors are either server-side (500) or a bad CSV (422).
-            stopwatch.Restart();
+            ConversionTimings? timings;
             try
             {
-                await converter.ConvertAsync(csvPath, parquetPath, http.RequestAborted);
+                timings = await converter.ConvertAsync(csvPath, parquetPath, http.RequestAborted);
             }
             catch (DuckDBException ex)
             {
@@ -126,9 +136,21 @@ public static class ConvertEndpoint
                 File.Delete(parquetPath);
                 throw;
             }
-            var conversionMs = stopwatch.ElapsedMilliseconds;
 
-            // 6. Stream the Parquet back from disk. A seekable stream makes ASP.NET Core send Content-Length,
+            // 6. Every conversion slot was busy for longer than the client should wait.
+            if (timings is not ConversionTimings elapsed)
+            {
+                logger.LogWarning("Conversion {Id} gave up after {Seconds} s waiting for a conversion slot",
+                    id, options.Value.ConversionQueueTimeoutSeconds);
+                http.Response.Headers.RetryAfter = "5";
+                return Results.Problem(
+                    statusCode: StatusCodes.Status503ServiceUnavailable,
+                    title: "Server busy",
+                    detail: $"All {options.Value.EffectiveMaxConcurrentConversions} conversion slots were busy for "
+                        + $"{options.Value.ConversionQueueTimeoutSeconds} seconds. Retry later or raise Conversion:MaxConcurrentConversions.");
+            }
+
+            // 7. Stream the Parquet back from disk. A seekable stream makes ASP.NET Core send Content-Length,
             // and DeleteOnClose removes the file when the response ends.
             var parquet = new FileStream(parquetPath, new FileStreamOptions
             {
@@ -138,22 +160,22 @@ public static class ConvertEndpoint
                 Options = FileOptions.Asynchronous | FileOptions.SequentialScan | FileOptions.DeleteOnClose
             });
 
-            // 9. One line per conversion.
+            // 10. One line per conversion.
             logger.LogInformation(
-                "Converted {Id}: {CsvBytes} CSV bytes -> {ParquetBytes} Parquet bytes, upload {UploadMs} ms, conversion {ConversionMs} ms",
-                id, csvBytes, parquet.Length, uploadMs, conversionMs);
+                "Converted {Id}: {CsvBytes} CSV bytes -> {ParquetBytes} Parquet bytes, upload {UploadMs} ms, queued {QueueWaitMs} ms, conversion {ConversionMs} ms",
+                id, csvBytes, parquet.Length, uploadMs, elapsed.QueueWaitMs, elapsed.ConversionMs);
 
             return Results.File(parquet, ParquetContentType, "converted.parquet");
         }
         catch (Exception ex) when (ex is (OperationCanceledException or IOException) && http.RequestAborted.IsCancellationRequested)
         {
-            // 8. The client went away: clean up (finally) and return quietly. Anything else propagates,
+            // 9. The client went away: clean up (finally) and return quietly. Anything else propagates,
             // including BadHttpRequestException, which the server turns into 400/413 itself.
             return Results.Empty;
         }
         finally
         {
-            // 7. The Parquet deletes itself when its stream closes.
+            // 8. The Parquet deletes itself when its stream closes.
             File.Delete(csvPath);
         }
     }

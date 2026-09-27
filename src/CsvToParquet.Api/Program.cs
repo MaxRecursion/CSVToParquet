@@ -1,3 +1,4 @@
+using System.Threading.RateLimiting;
 using CsvToParquet.Api;
 using Microsoft.Extensions.Hosting.WindowsServices;
 using Microsoft.Extensions.Options;
@@ -14,9 +15,48 @@ builder.Services.Configure<ConversionOptions>(builder.Configuration.GetSection(C
 builder.Services.AddSingleton<ParquetConverter>();
 builder.Services.AddOpenApi();
 
+// Admission control for parallel requests: at most MaxConcurrentRequests are in flight, the next
+// MaxQueuedRequests wait, and anything beyond that is rejected with 503 instead of piling onto the disk.
+builder.Services.AddRateLimiter(limiter =>
+{
+    limiter.OnRejected = async (context, ct) =>
+    {
+        var options = Options(context.HttpContext);
+        context.HttpContext.Response.Headers.RetryAfter = "5";
+        await Results.Problem(
+                statusCode: StatusCodes.Status503ServiceUnavailable,
+                title: "Server busy",
+                detail: $"The server already has {options.MaxConcurrentRequests} requests converting and "
+                    + $"{options.EffectiveMaxQueuedRequests} queued. Retry later or raise Conversion:MaxConcurrentRequests.")
+            .ExecuteAsync(context.HttpContext);
+    };
+
+    // One partition for the whole endpoint, built from the options the first request sees.
+    limiter.AddPolicy(ConvertEndpoint.RateLimiterPolicy, context =>
+    {
+        var options = Options(context);
+        return options.MaxConcurrentRequests > 0
+            ? RateLimitPartition.GetConcurrencyLimiter(ConvertEndpoint.RateLimiterPolicy, _ => new ConcurrencyLimiterOptions
+            {
+                PermitLimit = options.MaxConcurrentRequests,
+                QueueLimit = options.EffectiveMaxQueuedRequests,
+                QueueProcessingOrder = QueueProcessingOrder.OldestFirst
+            })
+            : RateLimitPartition.GetNoLimiter(ConvertEndpoint.RateLimiterPolicy);
+    });
+
+    static ConversionOptions Options(HttpContext context) =>
+        context.RequestServices.GetRequiredService<IOptions<ConversionOptions>>().Value;
+});
+
 var app = builder.Build();
 
 PrepareWorkDirectory(app.Services.GetRequiredService<IOptions<ConversionOptions>>().Value.WorkDirectory, app.Logger);
+
+// Opens the shared DuckDB instance now, so the first request does not pay for it and a bad setting fails at start-up.
+_ = app.Services.GetRequiredService<ParquetConverter>();
+
+app.UseRateLimiter();
 
 // Internal tool: the OpenAPI document and Swagger UI are served in every environment.
 app.MapOpenApi();

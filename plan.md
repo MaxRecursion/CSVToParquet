@@ -30,6 +30,12 @@ Note: without a `global.json`, `dotnet --version` in this folder resolves to `11
 8. OpenAPI document from `Microsoft.AspNetCore.OpenApi`; Swagger UI from `Swashbuckle.AspNetCore.SwaggerUI` (UI package only). Never add `Swashbuckle.AspNetCore`, `AddSwaggerGen` or `UseSwagger`.
 9. One build supports two hosting modes: IIS in-process (uploads up to ~4 GB, a hard IIS limit) and a Windows Service running Kestrel (no size cap).
 
+Revised in Phase 9 (see the deviations log):
+
+10. One warm in-memory DuckDB instance is shared by every conversion; each conversion runs on a connection duplicated from it. `threads`, `memory_limit`, `temp_directory` and `preserve_insertion_order` are DuckDB globals, so they are totals for the service and are applied once at startup.
+11. `COPY` runs on a dedicated thread, not a thread-pool thread, and is interrupted with `DuckDBCommand.Cancel()` when the request is aborted.
+12. Two configurable limits, not one: `MaxConcurrentRequests` (+ `MaxQueuedRequests`) admits requests through an ASP.NET Core concurrency rate limiter, and `MaxConcurrentConversions` (+ `ConversionQueueTimeoutSeconds`) caps conversions. Both shed load with 503 and `Retry-After`.
+
 ## 4. File layout
 
 | File | Purpose |
@@ -123,6 +129,19 @@ The template's `UnitTest1.cs` is deleted. Nothing else is added.
 - [x] 8.5 Final check: `dotnet build` 0/0, `dotnet test` all green, grep of `src/` for forbidden APIs, `/openapi/v1.json` content check, every S1–S11 ticked, no app left running.
 - [x] 8.6 Final summary: files created, package versions, deviations, how to run, and ✅/❌ for each acceptance item.
 
+### Phase 9: Parallel requests, configurable limits and speed
+- [x] 9.1 `ConversionOptions`: add `MaxConcurrentRequests` (0 = no limit), `MaxQueuedRequests` (`int?`, null = as many as are admitted), `ConversionQueueTimeoutSeconds` (0 = no timeout), `ParquetCompression` ("zstd"), `ParquetCompressionLevel` (`int?`), `ParquetRowGroupSize` (`long?`). Change `MaxConcurrentConversions` and `DuckDbThreads` to 0 = auto and `DuckDbMemoryLimit` to "" = DuckDB's default, exposed as `Effective*` properties.
+- [x] 9.2 `ConversionOptions.Validate()`: fail fast on a codec outside the allow-list (the value is interpolated into SQL), a compression level outside 1-22 or set for a codec other than zstd (DuckDB rejects that combination), a row group size below 1, a memory limit that is not a size, and a negative limit. Called from the converter's constructor, which is resolved at startup.
+- [x] 9.3 `ParquetConverter`: hold one open `DuckDBConnection("Data Source=:memory:")` for the life of the app, apply the DuckDB globals to it once, and give each conversion a `Duplicate()` of it. Measured: ~15 ms to create an instance versus ~0.3 ms to duplicate a connection.
+- [x] 9.4 `ParquetConverter`: run `ExecuteNonQuery` on a dedicated `Thread` and register `DuckDBCommand.Cancel()` on the cancellation token, so a conversion never occupies a thread-pool thread and an abandoned one releases its slot. `ConvertAsync` returns `ConversionTimings?`, null meaning no slot came free within `ConversionQueueTimeoutSeconds`.
+- [x] 9.5 `ParquetConverter`: one spill folder per process, `{WorkDirectory}/spill-{ProcessId}`, because DuckDB manages its own spill files and an overlapped IIS recycle runs two processes against one WorkDirectory.
+- [x] 9.6 `Program.cs`: `AddRateLimiter` with a concurrency policy built from `IOptions<ConversionOptions>` (no limiter when `MaxConcurrentRequests` is 0), `OnRejected` writing 503 ProblemDetails with `Retry-After`, `app.UseRateLimiter()`, and `.RequireRateLimiting` on the endpoint. Resolve `ParquetConverter` after the WorkDirectory check so DuckDB is warm and bad settings fail at startup.
+- [x] 9.7 `ConvertEndpoint`: return 503 with `Retry-After` when `ConvertAsync` returns null, add `.ProducesProblem(503)`, log the queue wait alongside the upload and conversion times, and open the upload `FileStream` with `BufferSize = 0` so the 1 MB copy buffer is not copied again.
+- [x] 9.8 `appsettings.json`: every new setting with its default.
+- [x] 9.9 Tests T8-T13 (section 7). `TestApp` gains a `Settings` dictionary for `Conversion:*` overrides and treats the per-process spill folder as part of an empty WorkDirectory.
+- [x] 9.10 `dotnet build` 0 warnings and 0 errors; `dotnet test` all green including `Category=LargeFile`; the parallel tests repeated 5 times with no flakes.
+- [x] 9.11 README: the new settings, the three limits, what to tune in what order, and the before/after measurements.
+
 ## 6. Large-file safeguards
 
 - [x] S1: Body size limit lifted per request via `IHttpMaxRequestBodySizeFeature`, before the body is read (Phase 4). Implemented by task 4.2.
@@ -175,3 +194,9 @@ Real Kestrel, marked `[Trait("Category", "LargeFile")]`:
 
 | # | Change | Reason | Approved |
 |---|---|---|---|
+| 1 | Task 3.6's "a new `DuckDBConnection` per call" becomes one shared in-memory instance with a duplicated connection per conversion | Creating an instance costs ~15 ms against ~0.3 ms to duplicate, and one instance lets DuckDB's scheduler share `DuckDbThreads` across conversions instead of each conversion guessing its share. Measured on 4 cores: one conversion 766 ms shared against 853 ms with its own instance; 4 at once 1142 ms against 1427 ms with 4 threads each | Requested: "make it as fast as possible with parallel requests support" |
+| 2 | Task 3.6's "synchronous `ExecuteNonQuery()` and no `Task.Run`" becomes a dedicated `Thread` per conversion | DuckDB has no async API, so `ExecuteNonQuery` blocks for the whole conversion. On a thread-pool thread that starves the pool the other parallel requests need, and the pool only grows about one thread per second. Measured with 8 conversions in flight: `GET /openapi/v1.json` 940 ms before, 43 ms after | As above |
+| 3 | `DuckDbThreads` and `DuckDbMemoryLimit` become totals for the service rather than per conversion, and `DuckDbMemoryLimit` defaults to DuckDB's own (~80% of RAM) instead of 4GB | They are DuckDB global settings, so one shared instance can only have one value. A total is also the honest number to reason about: the old default allowed `MaxConcurrentConversions x 4GB`. Set an explicit total when the service shares a machine | As above |
+| 4 | `MaxConcurrentConversions` and `DuckDbThreads` default to CPU-core counts instead of 2 and 4 | The old fixed defaults used at most 8 threads however large the machine. Measured at defaults, 8 conversions in parallel: 2676 ms before, 2409 ms after | As above |
+| 5 | Per-conversion spill folder `{id}.tmp` (task 3.7) becomes one per process, `spill-{ProcessId}` | A single DuckDB instance manages its own spill files, so per-conversion folders no longer apply. Keyed by process id rather than a fixed name because an overlapped IIS app-pool recycle runs two worker processes against one WorkDirectory | As above |
+| 6 | Row order is **not** reordered by default (`PreserveRowOrder` stays true) | `PreserveRowOrder: false` is the single biggest speed-up (about 20% off one conversion) but changes the output rows' order, which callers may rely on. Left as an opt-in and documented first in the README's tuning list | Judgement call; flagged in the summary |
