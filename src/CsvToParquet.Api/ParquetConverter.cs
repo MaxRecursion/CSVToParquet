@@ -28,11 +28,15 @@ public sealed class ParquetConverter : IDisposable
     /// </remarks>
     public const string SpillDirectoryPrefix = "spill-";
 
+    /// <summary>How often a cancelled conversion is interrupted again until its <c>COPY</c> returns.</summary>
+    private const int InterruptRetryMs = 50;
+
     private readonly ConversionOptions _options;
     private readonly ILogger<ParquetConverter> _logger;
     private readonly SemaphoreSlim _slots;
     private readonly int _slotWaitMs;
     private readonly string _copyOptions;
+    private readonly string _spillDirectory;
 
     /// <summary>Holds the shared in-memory database open: it is dropped when its last connection closes.</summary>
     private readonly DuckDBConnection _database;
@@ -46,31 +50,49 @@ public sealed class ParquetConverter : IDisposable
         _slotWaitMs = _options.ConversionQueueTimeoutSeconds > 0 ? _options.ConversionQueueTimeoutSeconds * 1000 : Timeout.Infinite;
         _copyOptions = BuildCopyOptions(_options);
 
-        var spillDirectory = Path.Combine(
-            Path.GetFullPath(_options.WorkDirectory),
-            $"{SpillDirectoryPrefix}{Environment.ProcessId}");
-        Directory.CreateDirectory(spillDirectory);
+        // No live process can share our id, so an existing folder was left by one that crashed.
+        _spillDirectory = Path.Combine(Path.GetFullPath(_options.WorkDirectory), $"{SpillDirectoryPrefix}{Environment.ProcessId}");
+        if (Directory.Exists(_spillDirectory))
+        {
+            Directory.Delete(_spillDirectory, recursive: true);
+        }
+
+        Directory.CreateDirectory(_spillDirectory);
 
         // Opened here rather than on the first request, so no request pays for DuckDB's start-up.
         _database = new DuckDBConnection("Data Source=:memory:");
         _database.Open();
-        using var command = _database.CreateCommand();
-        command.CommandText = $"""
+        Execute($"""
             SET threads = {_options.EffectiveDuckDbThreads};
-            {(_options.DuckDbMemoryLimit.Length > 0 ? $"SET memory_limit = '{Escape(_options.DuckDbMemoryLimit)}';" : "")}
-            SET temp_directory = '{Escape(spillDirectory)}';
+            SET temp_directory = '{Escape(_spillDirectory)}';
             SET preserve_insertion_order = {(_options.PreserveRowOrder ? "true" : "false")};
             SET autoinstall_known_extensions = false;
             SET autoload_known_extensions = false;
-            """;
-        command.ExecuteNonQuery();
+            """);
+
+        // DuckDB is the authority on what it accepts ('4GB', '8G', '512MiB', 'none', ...), so ask it rather than
+        // guess. The value is a quoted, escaped literal, so it cannot change the statement.
+        if (_options.DuckDbMemoryLimit.Length > 0)
+        {
+            try
+            {
+                Execute($"SET memory_limit = '{Escape(_options.DuckDbMemoryLimit)}';");
+            }
+            catch (DuckDBException ex)
+            {
+                Dispose();
+                throw new InvalidOperationException(
+                    $"Conversion:DuckDbMemoryLimit '{_options.DuckDbMemoryLimit}' is not a size DuckDB accepts, such as '4GB', '512MiB' or 'none'. {ex.Message}",
+                    ex);
+            }
+        }
 
         _logger.LogInformation(
             "DuckDB ready: {Conversions} concurrent conversions, {Threads} worker threads, memory limit {MemoryLimit}, spill {SpillDirectory}",
             _options.EffectiveMaxConcurrentConversions,
             _options.EffectiveDuckDbThreads,
             _options.DuckDbMemoryLimit.Length > 0 ? _options.DuckDbMemoryLimit : "DuckDB default",
-            spillDirectory);
+            _spillDirectory);
     }
 
     /// <summary>Converts <paramref name="csvPath"/> to <paramref name="parquetPath"/>, or returns null if no conversion slot came free in time.</summary>
@@ -98,10 +120,23 @@ public sealed class ParquetConverter : IDisposable
         return new ConversionTimings(queueWaitMs, conversion.ElapsedMilliseconds);
     }
 
+    /// <remarks>
+    /// <c>_slots</c> is deliberately not disposed: a conversion that outlives the host's shutdown timeout still calls
+    /// <c>Release()</c>, which would throw on a disposed semaphore, and a SemaphoreSlim holds nothing that needs freeing
+    /// unless its wait handle is used.
+    /// </remarks>
     public void Dispose()
     {
+        // Closing the last connection makes DuckDB delete its spill files, but not the folder, which it did not create.
         _database.Dispose();
-        _slots.Dispose();
+        try
+        {
+            Directory.Delete(_spillDirectory, recursive: false);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            // Still in use by a conversion that outlived shutdown; the start-up clean-up removes it within a day.
+        }
     }
 
     /// <summary>
@@ -111,8 +146,10 @@ public sealed class ParquetConverter : IDisposable
     /// DuckDB has no asynchronous API, so <c>ExecuteNonQuery</c> blocks for the whole conversion — minutes for a
     /// multi-GB file. On a thread-pool thread that would starve the pool of the threads the other parallel requests
     /// need for their uploads and downloads, because the pool only grows by about one thread per second. A dedicated
-    /// thread costs microseconds and the semaphore bounds how many exist. <c>Cancel()</c> then stops a conversion
-    /// whose client has gone away within a few milliseconds, which frees the slot for a request that is still there.
+    /// thread costs microseconds and the semaphore bounds how many exist. A conversion whose client has gone away
+    /// is interrupted, which frees the slot for a request that is still there. DuckDB acts on an interrupt between
+    /// row groups, so it stops once the row group being written is done: measured over a 100 MB CSV at the default
+    /// settings, 57 ms typical and 617 ms worst.
     /// </remarks>
     private Task RunCopyAsync(string sql, CancellationToken ct)
     {
@@ -126,17 +163,15 @@ public sealed class ParquetConverter : IDisposable
                 connection.Open();
                 using var command = connection.CreateCommand();
                 command.CommandText = sql;
-
-                // Disposing the registration waits for a callback that is already running, so the command outlives it.
-                using (ct.Register(() => Interrupt(command)))
-                {
-                    // A token that fired while the slot was being acquired interrupted nothing, because there was no
-                    // query yet. Check again here so an abandoned conversion is never started in the first place.
-                    ct.ThrowIfCancellationRequested();
-                    command.ExecuteNonQuery();
-                }
-
+                ExecuteInterruptibly(command, ct);
                 completion.SetResult();
+            }
+            catch (Exception) when (ct.IsCancellationRequested)
+            {
+                // An interrupt that lands while DuckDB is still binding the statement surfaces as a DuckDBException
+                // ("INTERRUPT Error: Interrupted!"), not OperationCanceledException. It must not reach the endpoint
+                // as one, or a client that went away would be logged as having sent a bad CSV.
+                completion.SetCanceled(ct);
             }
             catch (Exception ex)
             {
@@ -152,6 +187,35 @@ public sealed class ParquetConverter : IDisposable
         return completion.Task;
     }
 
+    /// <summary>Runs <paramref name="command"/>, interrupting it every 50 ms from the moment <paramref name="ct"/> fires until it returns.</summary>
+    /// <remarks>
+    /// <c>Cancel()</c> only interrupts a statement DuckDB has already started. One sent before <c>ExecuteNonQuery</c>,
+    /// or in roughly its first 100 microseconds, is silently dropped and the <c>COPY</c> runs to completion, holding its
+    /// slot for a client that is gone. Repeating the interrupt until the statement returns closes that window.
+    /// </remarks>
+    private void ExecuteInterruptibly(DuckDBCommand command, CancellationToken ct)
+    {
+        var interrupter = new Timer(_ => Interrupt(command));
+        try
+        {
+            // Disposing the registration waits for a callback that is already running, so the timer outlives it.
+            using (ct.Register(() => interrupter.Change(dueTime: 0, period: InterruptRetryMs)))
+            {
+                ct.ThrowIfCancellationRequested();
+                command.ExecuteNonQuery();
+            }
+        }
+        finally
+        {
+            // Waits for an interrupt that is already running, so none reaches the command after it is disposed.
+            using var stopped = new ManualResetEvent(initialState: false);
+            if (interrupter.Dispose(stopped))
+            {
+                stopped.WaitOne();
+            }
+        }
+    }
+
     /// <summary>Stops a running <c>COPY</c>. Interrupting one that has not started, or has already finished, is a no-op.</summary>
     private void Interrupt(DuckDBCommand command)
     {
@@ -161,10 +225,16 @@ public sealed class ParquetConverter : IDisposable
         }
         catch (DuckDBException ex)
         {
-            // This runs on whichever thread aborted the request, so it must not throw there. A conversion that
-            // cannot be interrupted simply runs to completion and its result is thrown away.
+            // This runs on a timer thread, so it must not throw there. The next retry tries again.
             _logger.LogDebug(ex, "Could not interrupt a conversion");
         }
+    }
+
+    private void Execute(string sql)
+    {
+        using var command = _database.CreateCommand();
+        command.CommandText = sql;
+        command.ExecuteNonQuery();
     }
 
     private static string BuildCopyOptions(ConversionOptions options)

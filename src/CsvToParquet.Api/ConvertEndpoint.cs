@@ -13,6 +13,13 @@ public static class ConvertEndpoint
 
     private const string ParquetContentType = "application/vnd.apache.parquet";
 
+    /// <summary>503 with <c>Retry-After</c>, for both ways the service sheds load: too many requests, or no conversion slot in time.</summary>
+    public static IResult ServerBusy(HttpContext http, string detail)
+    {
+        http.Response.Headers.RetryAfter = "5";
+        return Results.Problem(statusCode: StatusCodes.Status503ServiceUnavailable, title: "Server busy", detail: detail);
+    }
+
     public static IEndpointRouteBuilder MapConvertEndpoint(this IEndpointRouteBuilder app)
     {
         app.MapPost("/api/convert", ConvertAsync)
@@ -142,12 +149,9 @@ public static class ConvertEndpoint
             {
                 logger.LogWarning("Conversion {Id} gave up after {Seconds} s waiting for a conversion slot",
                     id, options.Value.ConversionQueueTimeoutSeconds);
-                http.Response.Headers.RetryAfter = "5";
-                return Results.Problem(
-                    statusCode: StatusCodes.Status503ServiceUnavailable,
-                    title: "Server busy",
-                    detail: $"All {options.Value.EffectiveMaxConcurrentConversions} conversion slots were busy for "
-                        + $"{options.Value.ConversionQueueTimeoutSeconds} seconds. Retry later or raise Conversion:MaxConcurrentConversions.");
+                return ServerBusy(http,
+                    $"All {options.Value.EffectiveMaxConcurrentConversions} conversion slots were busy for "
+                    + $"{options.Value.ConversionQueueTimeoutSeconds} seconds. Retry later or raise Conversion:MaxConcurrentConversions.");
             }
 
             // 7. Stream the Parquet back from disk. A seekable stream makes ASP.NET Core send Content-Length,

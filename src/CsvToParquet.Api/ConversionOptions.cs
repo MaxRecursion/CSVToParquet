@@ -1,5 +1,3 @@
-using System.Text.RegularExpressions;
-
 namespace CsvToParquet.Api;
 
 /// <summary>Settings bound from the <c>Conversion</c> configuration section.</summary>
@@ -9,12 +7,11 @@ public sealed class ConversionOptions
 
     private static readonly string DefaultWorkDirectory = Path.Combine(Path.GetTempPath(), "csv2parquet");
 
+    /// <summary>Longest <see cref="ConversionQueueTimeoutSeconds"/> whose milliseconds still fit in an int (about 24 days).</summary>
+    public const int MaxConversionQueueTimeoutSeconds = int.MaxValue / 1000;
+
     /// <summary>Parquet codecs DuckDB accepts. Also an allow-list, because the value is written into SQL.</summary>
     private static readonly string[] Codecs = ["uncompressed", "snappy", "gzip", "zstd", "brotli", "lz4", "lz4_raw"];
-
-    /// <summary>A DuckDB memory limit such as <c>4GB</c>, <c>512MiB</c> or <c>1.5 GB</c>.</summary>
-    private static readonly Regex MemoryLimitPattern =
-        new(@"^\d+(\.\d+)?\s*(b|[kmgt]b|[kmgt]ib)$", RegexOptions.IgnoreCase | RegexOptions.CultureInvariant);
 
     /// <summary>Local disk for temp CSV, Parquet and spill files. Empty means the default temp folder.</summary>
     public string WorkDirectory
@@ -38,7 +35,8 @@ public sealed class ConversionOptions
     /// <summary>Worker threads shared by every conversion, not per conversion. 0 = one per CPU core.</summary>
     public int DuckDbThreads { get; set; }
 
-    /// <summary>Memory shared by every conversion, not per conversion. Empty = DuckDB's own default (about 80% of RAM).</summary>
+    /// <summary>Memory shared by every conversion, not per conversion, in any form DuckDB accepts ('4GB', '8G', 'none').
+    /// Empty = DuckDB's own default (about 80% of RAM). DuckDB itself checks it when the converter starts.</summary>
     public string DuckDbMemoryLimit { get; set; } = "";
 
     /// <summary>Setting this to false is the single biggest speed-up, at the cost of reordering rows.</summary>
@@ -67,6 +65,7 @@ public sealed class ConversionOptions
     public int EffectiveMaxQueuedRequests => MaxQueuedRequests ?? MaxConcurrentRequests;
 
     /// <summary>Fails fast on a setting that would produce invalid SQL or an unusable limit.</summary>
+    /// <remarks><see cref="DuckDbMemoryLimit"/> is checked by DuckDB instead, when the converter starts.</remarks>
     public void Validate()
     {
         if (!Codecs.Contains(ParquetCompression, StringComparer.OrdinalIgnoreCase))
@@ -95,10 +94,15 @@ public sealed class ConversionOptions
             throw new InvalidOperationException($"Conversion:ParquetRowGroupSize {rowGroupSize} must be at least 1.");
         }
 
-        if (DuckDbMemoryLimit.Length > 0 && !MemoryLimitPattern.IsMatch(DuckDbMemoryLimit))
+        if (MaxConcurrentConversions < 0)
         {
             throw new InvalidOperationException(
-                $"Conversion:DuckDbMemoryLimit '{DuckDbMemoryLimit}' must be a size such as '4GB' or '512MiB', or empty for DuckDB's default.");
+                $"Conversion:MaxConcurrentConversions {MaxConcurrentConversions} cannot be negative (0 = one per CPU core).");
+        }
+
+        if (DuckDbThreads < 0)
+        {
+            throw new InvalidOperationException($"Conversion:DuckDbThreads {DuckDbThreads} cannot be negative (0 = one per CPU core).");
         }
 
         if (MaxConcurrentRequests < 0)
@@ -111,10 +115,10 @@ public sealed class ConversionOptions
             throw new InvalidOperationException($"Conversion:MaxQueuedRequests {queued} cannot be negative.");
         }
 
-        if (ConversionQueueTimeoutSeconds < 0)
+        if (ConversionQueueTimeoutSeconds is < 0 or > MaxConversionQueueTimeoutSeconds)
         {
             throw new InvalidOperationException(
-                $"Conversion:ConversionQueueTimeoutSeconds {ConversionQueueTimeoutSeconds} cannot be negative (0 = no timeout).");
+                $"Conversion:ConversionQueueTimeoutSeconds {ConversionQueueTimeoutSeconds} must be between 0 (no timeout) and {MaxConversionQueueTimeoutSeconds}.");
         }
     }
 }

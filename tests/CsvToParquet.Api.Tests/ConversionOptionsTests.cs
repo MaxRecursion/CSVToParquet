@@ -51,11 +51,14 @@ public sealed class ConversionOptionsTests
     [InlineData(nameof(ConversionOptions.ParquetCompressionLevel), 0)]
     [InlineData(nameof(ConversionOptions.ParquetCompressionLevel), 23)]
     [InlineData(nameof(ConversionOptions.ParquetRowGroupSize), 0L)]
-    [InlineData(nameof(ConversionOptions.DuckDbMemoryLimit), "lots")]
-    [InlineData(nameof(ConversionOptions.DuckDbMemoryLimit), "4GB'; SET threads = 1; --")]
+    // Negative is an error, not a quiet "auto": 0 is how you ask for one per CPU core.
+    [InlineData(nameof(ConversionOptions.MaxConcurrentConversions), -1)]
+    [InlineData(nameof(ConversionOptions.DuckDbThreads), -1)]
     [InlineData(nameof(ConversionOptions.MaxConcurrentRequests), -1)]
     [InlineData(nameof(ConversionOptions.MaxQueuedRequests), -1)]
     [InlineData(nameof(ConversionOptions.ConversionQueueTimeoutSeconds), -1)]
+    // 3,000,000 s in milliseconds overflows an int, which would make every conversion throw.
+    [InlineData(nameof(ConversionOptions.ConversionQueueTimeoutSeconds), 3_000_000)]
     public void UnusableSettingsFailFast(string setting, object value)
     {
         var options = new ConversionOptions();
@@ -67,6 +70,10 @@ public sealed class ConversionOptionsTests
     }
 
     [Fact]
+    public void LongestQueueTimeoutIsAccepted() =>
+        new ConversionOptions { ConversionQueueTimeoutSeconds = ConversionOptions.MaxConversionQueueTimeoutSeconds }.Validate();
+
+    [Fact]
     public void CompressionLevelOnlyAppliesToZstd()
     {
         var options = new ConversionOptions { ParquetCompression = "snappy", ParquetCompressionLevel = 5 };
@@ -76,12 +83,4 @@ public sealed class ConversionOptionsTests
 
         Assert.Contains("only applies to zstd", ex.Message, StringComparison.Ordinal);
     }
-
-    [Theory]
-    [InlineData("4GB")]
-    [InlineData("512MiB")]
-    [InlineData("1.5 GB")]
-    [InlineData("")]
-    public void MemoryLimitsDuckDbUnderstandsAreAccepted(string limit) =>
-        new ConversionOptions { DuckDbMemoryLimit = limit }.Validate();
 }

@@ -22,12 +22,9 @@ builder.Services.AddRateLimiter(limiter =>
     limiter.OnRejected = async (context, ct) =>
     {
         var options = Options(context.HttpContext);
-        context.HttpContext.Response.Headers.RetryAfter = "5";
-        await Results.Problem(
-                statusCode: StatusCodes.Status503ServiceUnavailable,
-                title: "Server busy",
-                detail: $"The server already has {options.MaxConcurrentRequests} requests converting and "
-                    + $"{options.EffectiveMaxQueuedRequests} queued. Retry later or raise Conversion:MaxConcurrentRequests.")
+        await ConvertEndpoint.ServerBusy(context.HttpContext,
+                $"The server already has {options.MaxConcurrentRequests} requests converting and "
+                + $"{options.EffectiveMaxQueuedRequests} queued. Retry later or raise Conversion:MaxConcurrentRequests.")
             .ExecuteAsync(context.HttpContext);
     };
 

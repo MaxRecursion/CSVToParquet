@@ -7,7 +7,7 @@ A small internal service that converts CSV files to Parquet. Large files (multi-
 - The Parquet is streamed back from disk with `Content-Length` and deleted when the response ends. Neither file is ever held in memory.
 - The conversion runs synchronously inside the request, on a thread of its own so that it never blocks the thread pool the other requests need. Requests are served in parallel: `MaxConcurrentRequests` caps how many are admitted and `MaxConcurrentConversions` caps how many convert at once; the rest queue.
 - One warm in-memory DuckDB instance is shared by every conversion, so no request pays for DuckDB's start-up and DuckDB's own scheduler spreads `DuckDbThreads` worker threads across whatever is running.
-- When a client disconnects, its conversion is interrupted within milliseconds and its slot goes to a request that is still waiting.
+- When a client disconnects, its conversion is interrupted and its slot goes to a request that is still waiting. DuckDB stops once the Parquet row group it is writing is done: typically tens of milliseconds, under a second at the default settings. A high `ParquetCompressionLevel` or a large `ParquetRowGroupSize` makes that longer.
 
 ## Run locally
 
@@ -42,16 +42,16 @@ Settings live in the `Conversion` section of `appsettings.json`. Override them a
 | MaxConcurrentRequests | 0 | Requests admitted at once; 0 = no limit |
 | MaxQueuedRequests | null | Requests queued once the limit is reached, then 503; null = as many as are admitted |
 | MaxConcurrentConversions | 0 | DuckDB conversions at once; 0 = one per CPU core, at least 2 and at most 8 |
-| ConversionQueueTimeoutSeconds | 0 | Seconds a request waits for a conversion slot before 503; 0 = as long as the client waits |
+| ConversionQueueTimeoutSeconds | 0 | Seconds a request waits for a conversion slot before 503; 0 = as long as the client waits; at most 2147483 (about 24 days) |
 | DuckDbThreads | 0 | Worker threads **shared by every conversion**; 0 = one per CPU core |
-| DuckDbMemoryLimit | "" | Memory **shared by every conversion**; empty = DuckDB's own default, about 80% of RAM |
+| DuckDbMemoryLimit | "" | Memory **shared by every conversion**, in any form DuckDB accepts (`4GB`, `8G`, `512MiB`, `none`); empty = DuckDB's own default, about 80% of RAM |
 | PreserveRowOrder | true | false reorders rows and is the single biggest speed-up |
 | ParquetCompression | "zstd" | `uncompressed`, `snappy`, `gzip`, `zstd`, `brotli`, `lz4` or `lz4_raw` |
 | ParquetCompressionLevel | null | zstd only, 1 (fastest) to 22; null = DuckDB's default of 3 |
 | ParquetRowGroupSize | null | Rows per row group; null = DuckDB's default of 122880 |
 | MaxUploadBytes | null | null = no limit |
 
-An empty `WorkDirectory` means the default temp folder. At startup the service creates the folder, fails fast if it isn't on a local drive or isn't writable, and deletes leftovers older than 24 hours. A setting the service cannot use — an unknown codec, a memory limit that isn't a size, a negative limit — fails at startup with a message naming it, not on the first request.
+An empty `WorkDirectory` means the default temp folder. At startup the service creates the folder, fails fast if it isn't on a local drive or isn't writable, and deletes leftovers older than 24 hours. A setting the service cannot use — an unknown codec, a memory limit DuckDB rejects, a negative limit — fails at startup with a message naming it, not on the first request.
 
 `MaxConcurrentRequests`, `MaxQueuedRequests`, `DuckDbThreads`, `DuckDbMemoryLimit`, `PreserveRowOrder` and the Parquet settings are read once at startup, so changing them needs a restart.
 
@@ -132,7 +132,7 @@ await response.Content.CopyToAsync(parquet);
 
 > Without `HttpCompletionOption.ResponseHeadersRead`, `HttpClient` buffers the whole Parquet in memory before `SendAsync` returns, and fails for responses above 2 GB.
 
-Send requests in parallel to convert several files at once; the service handles the queueing. If you set `MaxConcurrentRequests`, retry a 503 after the `Retry-After` delay rather than treating it as a failure. Cancelling a request stops its conversion on the server, so abandoning work costs nothing.
+Send requests in parallel to convert several files at once; the service handles the queueing. If you set `MaxConcurrentRequests`, retry a 503 after the `Retry-After` delay rather than treating it as a failure. Cancelling a request stops its conversion on the server once the row group being written is done, so abandoning work costs at most a fraction of a second of it.
 
 ## Deployment
 
@@ -147,7 +147,7 @@ dotnet publish src/CsvToParquet.Api -c Release -r win-x64 --self-contained false
 - Put it on a **local data drive** with free space of about **2 × the largest CSV × `MaxConcurrentConversions`**, not a small C: drive. The disk holds the uploaded CSV, the Parquet and DuckDB's spill files at the same time, for every conversion in flight. Set an absolute path, for example `"WorkDirectory": "D:\\csv2parquet"`.
 - The **app-pool or service account** needs write access to it (for example `IIS AppPool\CsvToParquet` for IIS).
 - Ideally exclude the folder from **real-time antivirus scanning**. Scanning multi-GB temp files slows every conversion and can lock files.
-- Each process gets its own `spill-<pid>` folder inside it, so an overlapped app-pool recycle cannot disturb the draining process's conversions. A folder left behind by a crash is removed by the startup clean-up once it is a day old.
+- Each process gets its own `spill-<pid>` folder inside it, so an overlapped app-pool recycle cannot disturb the draining process's conversions. The folder is removed on a clean shutdown; one left behind by a crash is removed by the startup clean-up once it is a day old, or straight away if a new process happens to get the same id.
 
 ### IIS: uploads up to ~4 GB
 
